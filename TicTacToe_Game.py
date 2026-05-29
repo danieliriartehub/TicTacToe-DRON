@@ -2,6 +2,7 @@ import cv2
 import mediapipe as mp
 import time
 import math
+from collections import deque
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 RTMP_URL             = "rtmp://192.168.137.1/live/key"
@@ -66,12 +67,28 @@ def safe_read(cap, src):
 # ─────────────────────────────────────────────────────────────────────────────
 # LÓGICA DEL JUEGO
 # ─────────────────────────────────────────────────────────────────────────────
-def fingers_up(lm):
-    return sum(1 for t in [8, 12, 16, 20]
-               if lm.landmark[t].y < lm.landmark[t - 2].y)
+def _d3(a, b):
+    """Distancia euclidiana 3D entre dos landmarks (x,y,z normalizados)."""
+    return math.sqrt((a.x-b.x)**2 + (a.y-b.y)**2 + (a.z-b.z)**2)
 
-def is_fist(lm):
-    return fingers_up(lm) <= 1
+def _finger_curled(lm, tip, mcp):
+    """True si la punta del dedo está más cerca de la muñeca que el nudillo MCP.
+    Funciona en cualquier orientación de la mano (no depende del eje Y)."""
+    wrist  = lm.landmark[0]
+    d_tip  = _d3(lm.landmark[tip], wrist)
+    d_mcp  = _d3(lm.landmark[mcp], wrist)
+    return d_tip < d_mcp * 1.45   # threshold calibrado
+
+def is_fist_raw(lm):
+    """Detecta puño usando distancias 3D: los 4 dedos deben estar cerrados."""
+    pairs = [(8, 5), (12, 9), (16, 13), (20, 17)]   # (tip, mcp) por dedo
+    return sum(_finger_curled(lm, t, m) for t, m in pairs) >= 4
+
+def smooth_fist(ps, lm):
+    """Buffer de 6 frames: reporta puño si ≥ 4 frames consecutivos lo confirman.
+    Elimina el parpadeo/jitter de la detección frame a frame."""
+    ps["fist_buf"].append(is_fist_raw(lm))
+    return sum(ps["fist_buf"]) >= 4
 
 def cell_at(px, py):
     if not (GOX <= px < GOX + GW and GOY <= py < GOY + GH):
@@ -113,7 +130,13 @@ def new_game():
     }
 
 def new_pstate():
-    return {"gstart": None, "confirmed": False, "scell": None, "last_fist": False}
+    return {
+        "gstart":    None,
+        "confirmed": False,
+        "scell":     None,
+        "last_fist": False,
+        "fist_buf":  deque([False] * 6, maxlen=6),  # buffer de suavizado
+    }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DIBUJO
@@ -187,24 +210,34 @@ def draw_hover(img, cell, color):
     _blend(img, ol, 0.22)
 
 # ── Cursor del jugador ────────────────────────────────────────────────────────
-def draw_cursor(img, x, y, player, active, progress=0.0):
+def draw_cursor(img, x, y, player, active, in_grid, progress=0.0):
     col  = PLAYER_COLOR[player]
     mark = PLAYER_MARK[player]
-    if active:
-        # Arco de progreso
-        if progress > 0.02:
-            ang = int(360 * min(1.0, progress))
-            cv2.ellipse(img, (x, y), (22, 22), -90, 0, ang, col, 3, cv2.LINE_AA)
-        # Anillo exterior
-        cv2.circle(img, (x, y), 14, col, 2, cv2.LINE_AA)
-        # Símbolo central
-        if mark == "X":
-            draw_x_mark(img, x, y, 5, col, 2)
-        else:
-            draw_o_mark(img, x, y, 5, col, 2)
+
+    if not active:
+        # Jugador inactivo: punto gris pequeño
+        cv2.circle(img, (x, y), 5, C_DGRAY, -1, cv2.LINE_AA)
+        cv2.circle(img, (x, y), 5, C_LGRAY,  1, cv2.LINE_AA)
+        return
+
+    if not in_grid:
+        # Jugador activo pero fuera del tablero: anillo gris punteado + flecha
+        cv2.circle(img, (x, y), 14, C_DGRAY, 2, cv2.LINE_AA)
+        cv2.circle(img, (x, y),  4, C_LGRAY, -1, cv2.LINE_AA)
+        # Pequeño texto "→ tablero"
+        cv2.putText(img, "entra al tablero", (x + 16, y + 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, C_LGRAY, 1, cv2.LINE_AA)
+        return
+
+    # Jugador activo dentro del tablero
+    if progress > 0.02:
+        ang = int(360 * min(1.0, progress))
+        cv2.ellipse(img, (x, y), (22, 22), -90, 0, ang, col, 3, cv2.LINE_AA)
+    cv2.circle(img, (x, y), 14, col, 2, cv2.LINE_AA)
+    if mark == "X":
+        draw_x_mark(img, x, y, 5, col, 2)
     else:
-        # Cursor tenue para jugador inactivo
-        cv2.circle(img, (x, y), 5, C_LGRAY, 1, cv2.LINE_AA)
+        draw_o_mark(img, x, y, 5, col, 2)
 
 # ── Panel de jugador ──────────────────────────────────────────────────────────
 def draw_player_panel(img, x1, y1, x2, y2, player, active, score, hand_ok, t):
@@ -361,20 +394,28 @@ while True:
     g   = game
     cp  = g["current"]
     now = time.time()
-    cursor_data = []   # (x, y, player, active, progress, hover_cell)
+    cursor_data = []   # (x, y, player, active, in_grid, progress, hover_cell)
 
     for player, lm in hands_detected.items():
         ps   = pstate[player]
         x    = int(lm.landmark[8].x * W)
         y    = int(lm.landmark[8].y * H)
         cell = cell_at(x, y)
-        fist = is_fist(lm)
+        fist = smooth_fist(ps, lm)   # detección 3D + buffer 6 frames
 
-        # Reiniciar temporizador si cambia gesto o celda
-        if fist != ps["last_fist"] or cell != ps["scell"]:
-            ps["gstart"]    = now if fist else None
+        if cell is None:
+            # Fuera del tablero: resetear todo inmediatamente.
+            # El timer NO debe pre-cargarse fuera del grid.
+            ps["gstart"]    = None
             ps["confirmed"] = False
-            ps["scell"]     = cell
+            ps["scell"]     = None
+        else:
+            # Dentro del tablero: máquina de estados normal
+            if fist != ps["last_fist"] or cell != ps["scell"]:
+                ps["gstart"]    = now if fist else None
+                ps["confirmed"] = False
+                ps["scell"]     = cell
+
         ps["last_fist"] = fist
 
         active   = (player == cp) and not g["over"]
@@ -403,7 +444,7 @@ while True:
                         g["current"] = other
                         pstate[other] = new_pstate()
 
-        cursor_data.append((x, y, player, active, progress, hover))
+        cursor_data.append((x, y, player, active, cell is not None, progress, hover))
 
     # ── Render ────────────────────────────────────────────────────────────────
     t = now  # timestamp para animaciones
@@ -412,12 +453,12 @@ while True:
     draw_board(frame, g["board"], g["wcells"])
 
     # 2. Hover de celda (antes del cursor para que quede debajo)
-    for x, y, player, active, progress, hover in cursor_data:
+    for x, y, player, active, in_grid, progress, hover in cursor_data:
         draw_hover(frame, hover, PLAYER_COLOR[player])
 
     # 3. Cursores
-    for x, y, player, active, progress, hover in cursor_data:
-        draw_cursor(frame, x, y, player, active, progress)
+    for x, y, player, active, in_grid, progress, hover in cursor_data:
+        draw_cursor(frame, x, y, player, active, in_grid, progress)
 
     # 4. HUD (encima de todo)
     draw_hud(frame, g, scores, set(hands_detected.keys()), t)
