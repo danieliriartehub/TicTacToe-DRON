@@ -6,9 +6,12 @@ import time
 # -----------------------------
 # Config
 # -----------------------------
-W, H = 640, 480                  # resolución base interna (calidad)
-CONFIRM_TIME = 1.0               # mantener gesto 4s para confirmar
+W, H = 640, 480
+CONFIRM_TIME = 1.0
 WIN_NAME = "Camara | Tic Tac Toe (Resizable)"
+
+RTMP_URL = "rtmp://192.168.137.1/live/key"
+RTMP_RECONNECT_DELAY = 3.0   # segundos entre intentos de reconexión
 
 # -----------------------------
 # MediaPipe Hands
@@ -23,10 +26,41 @@ hands = mp_hands.Hands(
 )
 
 # -----------------------------
-# Helpers
+# Helpers: captura RTMP con reconexión
+# -----------------------------
+def open_capture(source):
+    cap = cv2.VideoCapture(source)
+    if isinstance(source, str):
+        # Parámetros FFmpeg para baja latencia en RTMP
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    return cap
+
+def read_frame(cap, source):
+    """Lee un frame; si falla, intenta reconectar en bucle."""
+    ret, frame = cap.read()
+    if ret:
+        return cap, frame
+
+    if isinstance(source, str):
+        print(f"[RTMP] Stream perdido. Reconectando en {RTMP_RECONNECT_DELAY}s...")
+        cap.release()
+        time.sleep(RTMP_RECONNECT_DELAY)
+        while True:
+            cap = open_capture(source)
+            ret, frame = cap.read()
+            if ret:
+                print("[RTMP] Reconexión exitosa.")
+                return cap, frame
+            print(f"[RTMP] Sin señal. Reintentando en {RTMP_RECONNECT_DELAY}s...")
+            cap.release()
+            time.sleep(RTMP_RECONNECT_DELAY)
+    return cap, None
+
+# -----------------------------
+# Helpers: lógica de juego
 # -----------------------------
 def contar_dedos(hand_landmarks):
-    tips = [8, 12, 16, 20]  # índice, medio, anular, meñique
+    tips = [8, 12, 16, 20]
     fingers = 0
     for tip in tips:
         if hand_landmarks.landmark[tip].y < hand_landmarks.landmark[tip - 2].y:
@@ -35,9 +69,9 @@ def contar_dedos(hand_landmarks):
 
 def gesto_desde_dedos(dedos):
     if dedos == 0:
-        return "FIST"    # puño -> O
+        return "FIST"
     if dedos == 2:
-        return "PEACE"   # paz  -> X
+        return "PEACE"
     return "OTHER"
 
 def cell_from_point(x, y, grid_origin, grid_wh, n=3):
@@ -53,19 +87,20 @@ def cell_from_point(x, y, grid_origin, grid_wh, n=3):
 
 def check_winner(board):
     lines = []
-    lines.extend(board)  # filas
-    lines.extend([[board[r][c] for r in range(3)] for c in range(3)])  # columnas
-    lines.append([board[i][i] for i in range(3)])  # diag
-    lines.append([board[i][2 - i] for i in range(3)])  # diag
-
+    lines.extend(board)
+    lines.extend([[board[r][c] for r in range(3)] for c in range(3)])
+    lines.append([board[i][i] for i in range(3)])
+    lines.append([board[i][2 - i] for i in range(3)])
     for line in lines:
         if line[0] != "" and line[0] == line[1] == line[2]:
             return line[0]
-
     if all(board[r][c] != "" for r in range(3) for c in range(3)):
         return "DRAW"
     return None
 
+# -----------------------------
+# Helpers: dibujo
+# -----------------------------
 def draw_grid(img, origin, size, n=3, thickness=3):
     ox, oy = origin
     w, h = size
@@ -81,17 +116,14 @@ def draw_marks(img, board, origin, size, n=3):
     w, h = size
     cell_w = w / n
     cell_h = h / n
-
     for r in range(n):
         for c in range(n):
             mark = board[r][c]
             if mark == "":
                 continue
-
             cx = int(ox + c * cell_w + cell_w / 2)
             cy = int(oy + r * cell_h + cell_h / 2)
             s = int(min(cell_w, cell_h) * 0.28)
-
             if mark == "O":
                 cv2.circle(img, (cx, cy), s, (255, 255, 255), 3)
             elif mark == "X":
@@ -104,12 +136,7 @@ def draw_progress_bar(img, x, y, w, h, progress):
     cv2.rectangle(img, (x, y), (x + fill_w, y + h), (255, 255, 255), -1)
 
 def get_window_size(name, fallback_w, fallback_h):
-    """
-    Devuelve (win_w, win_h). En OpenCV moderno (Windows/Linux) suele funcionar.
-    Si no está disponible, retorna fallback.
-    """
     try:
-        # x, y, w, h
         rect = cv2.getWindowImageRect(name)
         return rect[2], rect[3]
     except Exception:
@@ -118,34 +145,52 @@ def get_window_size(name, fallback_w, fallback_h):
 # -----------------------------
 # Main
 # -----------------------------
-cap = cv2.VideoCapture(0)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, W)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, H)
+print(f"[INFO] Conectando al stream RTMP: {RTMP_URL}")
+cap = open_capture(RTMP_URL)
 
-# tablero
+# Si el stream no está disponible al inicio, esperamos
+if not cap.isOpened():
+    print(f"[RTMP] No se pudo abrir el stream. Esperando señal...")
+    cap.release()
+    while True:
+        cap = open_capture(RTMP_URL)
+        if cap.isOpened():
+            ret, _ = cap.read()
+            if ret:
+                print("[RTMP] Stream disponible.")
+                cap.release()
+                cap = open_capture(RTMP_URL)
+                break
+        print(f"[RTMP] Sin señal. Reintentando en {RTMP_RECONNECT_DELAY}s...")
+        cap.release()
+        time.sleep(RTMP_RECONNECT_DELAY)
+
+# Detectar resolución real del stream
+stream_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or W
+stream_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or H
+print(f"[INFO] Resolución del stream: {stream_w}x{stream_h}")
+
+# Tablero
 board = [["" for _ in range(3)] for _ in range(3)]
 game_over = False
 result = None
 
-# confirmación por tiempo (hold 4s) + one-shot
 last_gesture = "NONE"
 gesture_start_time = None
 confirmed = False
 stable_cell = None
 
-# tablero grande dentro del canvas
 grid_w = 440
 grid_h = 440
 grid_origin = ((W - grid_w) // 2, (H - grid_h) // 2)
 grid_size = (grid_w, grid_h)
 
-# Ventana redimensionable por el usuario
 cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL)
-cv2.resizeWindow(WIN_NAME, 1400, 700)  # tamaño inicial cómodo
+cv2.resizeWindow(WIN_NAME, 1400, 700)
 
-while cap.isOpened():
-    ret, frame = cap.read()
-    if not ret:
+while True:
+    cap, frame = read_frame(cap, RTMP_URL)
+    if frame is None:
         break
 
     frame = cv2.flip(frame, 1)
@@ -153,11 +198,9 @@ while cap.isOpened():
 
     canvas = np.zeros((H, W, 3), dtype=np.uint8)
 
-    # dibuja grilla + marcas
     draw_grid(canvas, grid_origin, grid_size, thickness=4)
     draw_marks(canvas, board, grid_origin, grid_size)
 
-    # mano
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results_mp = hands.process(rgb)
 
@@ -175,22 +218,18 @@ while cap.isOpened():
         y = int(hlm.landmark[8].y * H)
         aimed_cell = cell_from_point(x, y, grid_origin, grid_size, n=3)
 
-        # cursor
         cv2.circle(canvas, (x, y), 8, (255, 255, 255), -1)
 
-        # reinicio por cambio de gesto
         if gesture != last_gesture:
             gesture_start_time = time.time()
             confirmed = False
             stable_cell = aimed_cell
 
-        # estabilidad por celda
         if aimed_cell != stable_cell:
             gesture_start_time = time.time()
             confirmed = False
             stable_cell = aimed_cell
 
-        # confirmación por tiempo
         if (not game_over) and (not confirmed) and (gesture in ["FIST", "PEACE"]) and (aimed_cell is not None):
             elapsed = time.time() - gesture_start_time
             progress = min(1.0, elapsed / CONFIRM_TIME)
@@ -204,7 +243,6 @@ while cap.isOpened():
                 if board[r][c] == "":
                     board[r][c] = "O" if gesture == "FIST" else "X"
                     confirmed = True
-
                     res = check_winner(board)
                     if res is not None:
                         game_over = True
@@ -213,8 +251,9 @@ while cap.isOpened():
     last_gesture = gesture
 
     # UI
-    cv2.putText(canvas, "MODE: ONE_SHOT + HOLD 4s", (10, 25),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    src_label = "RTMP"
+    cv2.putText(canvas, f"MODE: ONE_SHOT+HOLD {CONFIRM_TIME:.0f}s | SRC: {src_label}", (10, 25),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
     if aimed_cell is not None:
         cv2.putText(canvas, f"CELDA: {aimed_cell}", (10, 55),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
@@ -229,10 +268,8 @@ while cap.isOpened():
     cv2.putText(canvas, "Controles: r=reiniciar  q=salir", (10, H - 15),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-    # cámara + canvas lado a lado
     combined = np.hstack([frame, canvas])
 
-    # --- Escalado al tamaño actual de la ventana (lo que pediste) ---
     win_w, win_h = get_window_size(WIN_NAME, combined.shape[1], combined.shape[0])
     if win_w > 50 and win_h > 50:
         combined_view = cv2.resize(combined, (win_w, win_h), interpolation=cv2.INTER_LINEAR)
